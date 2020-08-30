@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import requests
+import asyncio
+import aiohttp
 
 from .common import BASE_URL, ENDPOINTS, api_url_build, sprite_url_build
 from .cache import save, load, save_sprite, load_sprite, get_sprite_path
@@ -69,6 +71,76 @@ def get_sprite(sprite_type, sprite_id, **kwargs):
             pass
 
     data = _call_sprite_api(sprite_type, sprite_id, **kwargs)
+    save_sprite(data, sprite_type, sprite_id, **kwargs)
+
+    return data
+
+
+async def _async_call_api(endpoint, resource_id=None, subresource=None):
+    
+    url = api_url_build(endpoint, resource_id, subresource)
+
+    # Get a list of resources at the endpoint, if no resource_id is given.
+    get_endpoint_list = resource_id is None
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, raise_for_status = True) as response:
+            if response.status == 200:
+                data = await response.json()
+
+    if get_endpoint_list and data['count'] != len(data['results']):
+        # We got a section of all results; we want ALL of them.
+        items = data['count']
+        num_items = dict(limit=items)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, raise_for_status = True) as response:
+                if response.status == 200:
+                    data = await response.json()
+
+    return data
+
+
+async def async_get_data(endpoint, resource_id=None, subresource=None, **kwargs):
+
+    if not kwargs.get('force_lookup', False):
+        try:
+            data = load(endpoint, resource_id, subresource)
+            return data
+        except KeyError:
+            pass
+
+    data = await _async_call_api(endpoint, resource_id, subresource)
+    save(data, endpoint, resource_id, subresource)
+
+    return data
+
+
+async def _async_call_sprite_api(sprite_type, sprite_id, **kwargs):
+
+    url = sprite_url_build(sprite_type, sprite_id, **kwargs)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, raise_for_status = True) as response:
+            if response.status == 200:
+                data = await response.read()
+
+    abs_path = get_sprite_path(sprite_type, sprite_id, **kwargs)
+    data = dict(img_data=data, path=abs_path)
+
+    return data
+
+
+async def async_get_sprite(sprite_type, sprite_id, **kwargs):
+
+    if not kwargs.get('force_lookup', False):
+        try:
+            data = load_sprite(sprite_type, sprite_id, **kwargs)
+            return data
+        except FileNotFoundError:
+            pass
+
+    data = await _async_call_sprite_api(sprite_type, sprite_id, **kwargs)
     save_sprite(data, sprite_type, sprite_id, **kwargs)
 
     return data
