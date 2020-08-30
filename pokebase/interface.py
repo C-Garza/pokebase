@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 
-from .api import get_data, get_sprite
+from .api import get_data, get_sprite, async_get_data, async_get_sprite
 from .common import BASE_URL, api_url_build, sprite_url_build
+import asyncio
 
 
 def _make_obj(obj):
@@ -61,6 +62,71 @@ def _convert_id_to_name(endpoint, id_):
 def _convert_name_to_id(endpoint, name):
 
     resource_data = get_data(endpoint)['results']
+
+    for resource in resource_data:
+        if resource.get('name') == name:
+            return int(resource.get('url').split('/')[-2])
+
+    return None
+
+
+async def _async_make_obj(obj):
+    """Takes an object and asynchronously returns a corresponding API class.
+
+    The names and values of the data will match exactly with those found
+    in the online docs at https://pokeapi.co/docsv2/ . In some cases, the data
+    may be of a standard type, such as an integer or string. For those cases,
+    the input value is simply returned, unchanged.
+
+    :param obj: the object to be converted
+    :return either the same value, if it does not need to be converted, or a
+    APIResource or APIMetadata instance, depending on the data inputted.
+    """
+
+    if isinstance(obj, dict):
+        if 'url' in obj.keys():
+            url = obj['url']
+            id_ = int(url.split('/')[-2])      # ID of the data.
+            endpoint = url.split('/')[-3]  # Where the data is located.
+            return await AsyncAPIResource(endpoint, id_, lazy_load=True).init()
+
+        return await AsyncAPIMetadata(obj).init()
+
+    return obj
+
+
+async def async_name_id_convert(endpoint, name_or_id):
+
+    if isinstance(name_or_id, int):
+        id_ = name_or_id
+        name = await _async_convert_id_to_name(endpoint, id_)
+
+    elif isinstance(name_or_id, str):
+        name = name_or_id
+        id_ = await _async_convert_name_to_id(endpoint, name)
+
+    else:
+        raise ValueError('the name or id \'{}\' could not be converted'
+                         .format(name_or_id))
+
+    return name, id_
+
+
+async def _async_convert_id_to_name(endpoint, id_):
+    resource_data = (await async_get_data(endpoint))['results']
+
+    for resource in resource_data:
+        if resource['url'].split('/')[-2] == str(id_):
+
+            # Return the matching name, or None if it doesn't exsist.
+            return resource.get('name', None)
+
+    return None
+
+
+async def _async_convert_name_to_id(endpoint, name):
+
+    resource_data = (await async_get_data(endpoint))['results']
 
     for resource in resource_data:
         if resource.get('name') == name:
@@ -263,6 +329,223 @@ class SpriteResource(object):
 
         if not self.__loaded:
             self._load()
+            self.__loaded = True
+
+            return self.__getattribute__(attr)
+
+        else:
+            raise AttributeError('{} object has no attribute {}'
+                                 .format(type(self), attr))
+
+
+class AsyncAPIResource(object):
+    """Core API class, used for accessing the bulk of the data asynchronously.
+
+    The class uses a modified __getattr__ function to serve the appropriate
+    data, so lookup data via the `.` operator, and use the `PokeAPI docs
+    <https://pokeapi.co/docsv2/>`_ or the builtin `dir` function to see the
+    possible lookups.
+
+    This class takes the complexity out of lots of similar classes for each
+    different kind of data served by the API, all of which are very similar,
+    but not identical.
+    """
+
+    def __init__(self, endpoint, name_or_id, lazy_load=False, force_lookup=False):
+
+        self.endpoint = endpoint
+        self.name_or_id = name_or_id
+        self.__loaded = False
+        self.__force_lookup = force_lookup
+        self.lazy_load = lazy_load
+
+    async def init(self):
+        name, id_ = await async_name_id_convert(self.endpoint, self.name_or_id)
+        url = api_url_build(self.endpoint, id_)
+
+        self.__dict__.update({'name': name,
+                              'endpoint': self.endpoint,
+                              'id_': id_,
+                              'url': url})
+
+        if not self.lazy_load:
+            await self._load()
+            self.__loaded = True
+
+        return self
+
+    async def __getattr__(self, attr):
+        """Modified method to auto-load the data when it is needed.
+
+        If the data has not yet been looked up, it is loaded, and then checked
+        for the requested attribute. If it is not found, AttributeError is
+        raised.
+        """
+        if not self.__loaded:
+            await self._load()
+            self.__loaded = True
+
+            return self.__getattribute__(attr)
+
+        else:
+            raise AttributeError('{} object has no attribute {}'
+                                 .format(type(self), attr))
+
+    def __str__(self):
+        return str(self.name)
+
+    def __repr__(self):
+        return '<{}-{}>'.format(self.endpoint, self.name)
+
+    async def _load(self):
+        """Function to collect reference data and connect it to the instance as
+         attributes.
+
+         Internal function, does not usually need to be called by the user, as
+         it is called automatically when an attribute is requested.
+
+        :return None
+        """
+
+        data = await async_get_data(self.endpoint, self.id_, force_lookup=self.__force_lookup)
+        # Make our custom objects from the data.
+        for key, val in data.items():
+
+            if key == 'location_area_encounters' \
+                    and self.endpoint == 'pokemon':
+
+                params = val.split('/')[-3:]
+                ep, id_, subr = params
+                encounters = await async_get_data(ep, int(id_), subr)
+                data[key] = [await _async_make_obj(enc) for enc in encounters]
+                continue
+
+            if isinstance(val, dict):
+                data[key] = await _async_make_obj(val)
+
+            elif isinstance(val, list):
+                data[key] = [await _async_make_obj(i) for i in val]
+
+        self.__dict__.update(data)
+
+        return None
+
+
+class AsyncAPIResourceList(object):
+    """Class for an async data container.
+
+    Used to access data corresponding to a category, rather than an individual
+    reference. Ex. APIResourceList('berry') gives information about all
+    berries, such as which ID's correspond to which berry names, and
+    how many berries there are.
+
+    You can iterate through all the names or all the urls, using the respective
+    properties. You can also iterate on the object itself to run through the
+    `dict`s with names and urls together, whatever floats your boat.
+    """
+
+    def __init__(self, endpoint, force_lookup=False):
+        """Creates a new APIResourceList instance.
+
+        :param name: the name of the resource to get (ex. 'berry' or 'move')
+        """
+        self.name = endpoint
+        self.force_lookup = force_lookup
+
+    async def init(self):
+        response = await async_get_data(self.name, force_lookup=self.force_lookup)
+
+        self.__results = [i for i in response['results']]
+        self.count = response['count']
+
+        return self
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        return iter(self.__results)
+
+    def __str__(self):
+        return str(self.__results)
+
+    @property
+    def names(self):
+        """Useful iterator for all the resource's names."""
+        for result in self.__results:
+            yield result.get('name', result['url'].split('/')[-2])
+
+    @property
+    def urls(self):
+        """Useful iterator for all of the resource's urls."""
+        for result in self.__results:
+            yield result['url']
+
+
+class AsyncAPIMetadata(object):
+    """Helper class for smaller asynchronous references.
+
+    This class emulates a dictionary, but attribute lookup is via the `.`
+    operator, not indexing. (ex. instance.attr, not instance['attr']).
+
+    Used for "Common Models" classes and APIResource helper classes.
+    https://pokeapi.co/docsv2/#common-models
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    async def init(self):
+        for key, val in self.data.items():
+
+            if isinstance(val, dict):
+                self.data[key] = await _async_make_obj(val)
+
+            if isinstance(val, list):
+                self.data[key] = [await _async_make_obj(i) for i in val]
+
+        self.__dict__.update(self.data)
+
+        return self
+
+
+class AsyncSpriteResource(object):
+
+    def __init__(self, sprite_type, sprite_id, **kwargs):
+
+        url = sprite_url_build(sprite_type, sprite_id, **kwargs)
+
+        self.__dict__.update({'sprite_id': sprite_id,
+                              'sprite_type': sprite_type,
+                              'url': url})
+
+        self.__loaded = False
+        self.__force_lookup = kwargs.get('force_lookup', False)
+        self.__original_kwargs = kwargs
+
+    async def init(self):
+        if not self.__original_kwargs.get('lazy_load', False):
+            await self._load()
+            self.__loaded = True
+        return self
+
+    async def _load(self):
+
+        data = await async_get_sprite(self.sprite_type, self.sprite_id, **self.__original_kwargs)
+        self.__dict__.update(data)
+
+        return None
+
+    async def __getattr__(self, attr):
+        """Modified method to auto-load the data when it is needed.
+
+        If the data has not yet been looked up, it is loaded, and then checked
+        for the requested attribute. If it is not found, AttributeError is
+        raised.
+        """
+
+        if not self.__loaded:
+            await self._load()
             self.__loaded = True
 
             return self.__getattribute__(attr)
